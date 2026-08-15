@@ -3,20 +3,18 @@
 #include "esp_err.h"
 
 /**
- * Inicia o servidor HTTP com os endpoints:
+ * Inicia o servidor HTTP (porta 8080) com:
  *
- *   GET /wol?mac=AA:BB:CC:DD:EE:FF&ip=192.168.0.50&port=3389
- *     Envia o pacote mágico e, se "ip" for informado, dispara uma
- *     verificação em background tentando abrir uma conexão TCP na
- *     porta indicada (padrão 3389/RDP) até o PC responder ou dar timeout.
- *     Responde imediatamente, não espera a verificação terminar.
+ *   GET  /                     Página HTML com um botão por PC.
+ *   GET  /api/targets          JSON com a lista de PCs configurados.
+ *   GET  /api/wol?target=NOME  Envia o pacote mágico. Se o alvo tiver
+ *                              "ip" preenchido em wol_targets.h, também
+ *                              dispara verificação de wake em background.
+ *   GET  /api/status?target=NOME
+ *                              Estado da verificação (se configurada).
  *
- *   GET /wol/status
- *     Retorna o resultado da última verificação (pending/success/timeout).
+ * Edite main/wol_targets.h para adicionar/remover PCs ou preencher o IP.
  *
- * Parâmetros omitidos usam os valores padrão definidos no topo do wol.c
- * (WOL_DEFAULT_MAC, WOL_DEFAULT_IP, WOL_DEFAULT_PORT).
- *
- * Chame depois que o WiFi já estiver conectado (não depende do MicroLink).
+ * Chame depois que o WiFi já estiver conectado.
  */
 esp_err_t wol_http_server_start(void);

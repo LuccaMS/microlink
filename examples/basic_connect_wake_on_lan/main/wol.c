@@ -1,7 +1,9 @@
 #include "wol.h"
+#include "wol_targets.h"
 
 #include <string.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <errno.h>
 
 #include "esp_http_server.h"
@@ -13,21 +15,12 @@
 
 static const char *TAG = "wol";
 
-// ---------------------------------------------------------------------
-// CONFIGURE AQUI:
-#define WOL_DEFAULT_MAC "9C:6B:00:A3:D3:A3"
-#define WOL_DEFAULT_IP  ""     // ex: "192.168.0.50" — vazio desativa verificação por padrão
-#define WOL_DEFAULT_PORT 3389  // RDP. Use 22 para SSH, etc.
-
-// Token opcional pra proteger o endpoint. "" desativa a checagem.
 #define WOL_SHARED_TOKEN ""
 
-// Janela de verificação de wake
-#define WOL_VERIFY_GRACE_MS     5000    // espera antes da 1a tentativa
-#define WOL_VERIFY_RETRY_MS     3000    // intervalo entre tentativas
-#define WOL_VERIFY_TIMEOUT_MS   120000  // desiste depois disso
+#define WOL_VERIFY_GRACE_MS     5000
+#define WOL_VERIFY_RETRY_MS     3000
+#define WOL_VERIFY_TIMEOUT_MS   120000
 #define WOL_VERIFY_CONNECT_TIMEOUT_MS 2000
-// ---------------------------------------------------------------------
 
 typedef enum {
     WOL_VERIFY_NONE = 0,
@@ -38,18 +31,26 @@ typedef enum {
 
 typedef struct {
     wol_verify_state_t state;
-    char target_ip[16];
-    uint16_t target_port;
     uint32_t started_at_ms;
-    uint32_t finished_at_ms; // 0 se ainda pending
+    uint32_t finished_at_ms;
 } wol_status_t;
 
-static wol_status_t s_status = { .state = WOL_VERIFY_NONE };
+static wol_status_t s_status[WOL_TARGET_COUNT];
 static SemaphoreHandle_t s_status_mutex = NULL;
 
 static uint32_t now_ms(void)
 {
     return (uint32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS);
+}
+
+static int find_target(const char *name)
+{
+    for (size_t i = 0; i < WOL_TARGET_COUNT; i++) {
+        if (strcmp(WOL_TARGETS[i].name, name) == 0) {
+            return (int)i;
+        }
+    }
+    return -1;
 }
 
 static bool parse_mac(const char *str, uint8_t *mac)
@@ -103,7 +104,6 @@ static esp_err_t send_magic_packet(const uint8_t *mac)
     return ESP_OK;
 }
 
-/* Tenta uma conexão TCP curta pra ver se a porta já está respondendo */
 static bool tcp_port_is_open(const char *ip, uint16_t port, uint32_t timeout_ms)
 {
     int sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
@@ -111,7 +111,6 @@ static bool tcp_port_is_open(const char *ip, uint16_t port, uint32_t timeout_ms)
         return false;
     }
 
-    /* socket não-bloqueante pra poder aplicar timeout no connect */
     int flags = fcntl(sock, F_GETFL, 0);
     fcntl(sock, F_SETFL, flags | O_NONBLOCK);
 
@@ -147,27 +146,18 @@ static bool tcp_port_is_open(const char *ip, uint16_t port, uint32_t timeout_ms)
 
 static void wol_verify_task(void *arg)
 {
-    char ip[16];
-    uint16_t port;
+    int idx = (int)(intptr_t)arg;
+    const wol_target_t *target = &WOL_TARGETS[idx];
 
-    if (xSemaphoreTake(s_status_mutex, portMAX_DELAY) == pdTRUE) {
-        strncpy(ip, s_status.target_ip, sizeof(ip));
-        port = s_status.target_port;
-        xSemaphoreGive(s_status_mutex);
-    } else {
-        vTaskDelete(NULL);
-        return;
-    }
-
-    ESP_LOGI(TAG, "Verificando wake de %s:%u (aguardando %d ms antes da 1a tentativa)",
-             ip, port, WOL_VERIFY_GRACE_MS);
+    ESP_LOGI(TAG, "[%s] Verificando %s:%u (aguardando %d ms)",
+             target->name, target->ip, target->port, WOL_VERIFY_GRACE_MS);
     vTaskDelay(pdMS_TO_TICKS(WOL_VERIFY_GRACE_MS));
 
     uint32_t deadline = now_ms() + WOL_VERIFY_TIMEOUT_MS;
     bool success = false;
 
     while (now_ms() < deadline) {
-        if (tcp_port_is_open(ip, port, WOL_VERIFY_CONNECT_TIMEOUT_MS)) {
+        if (tcp_port_is_open(target->ip, target->port, WOL_VERIFY_CONNECT_TIMEOUT_MS)) {
             success = true;
             break;
         }
@@ -175,100 +165,210 @@ static void wol_verify_task(void *arg)
     }
 
     if (xSemaphoreTake(s_status_mutex, portMAX_DELAY) == pdTRUE) {
-        s_status.state = success ? WOL_VERIFY_SUCCESS : WOL_VERIFY_TIMEOUT;
-        s_status.finished_at_ms = now_ms();
+        s_status[idx].state = success ? WOL_VERIFY_SUCCESS : WOL_VERIFY_TIMEOUT;
+        s_status[idx].finished_at_ms = now_ms();
         xSemaphoreGive(s_status_mutex);
     }
 
-    ESP_LOGI(TAG, "Verificacao de %s:%u: %s", ip, port,
-             success ? "SUCESSO (porta respondeu)" : "TIMEOUT (nao respondeu a tempo)");
+    ESP_LOGI(TAG, "[%s] Verificacao: %s", target->name,
+             success ? "SUCESSO" : "TIMEOUT");
 
     vTaskDelete(NULL);
 }
 
-static void start_verification(const char *ip, uint16_t port)
+static void start_verification(int idx)
 {
     if (xSemaphoreTake(s_status_mutex, portMAX_DELAY) == pdTRUE) {
-        s_status.state = WOL_VERIFY_PENDING;
-        strncpy(s_status.target_ip, ip, sizeof(s_status.target_ip) - 1);
-        s_status.target_ip[sizeof(s_status.target_ip) - 1] = '\0';
-        s_status.target_port = port;
-        s_status.started_at_ms = now_ms();
-        s_status.finished_at_ms = 0;
+        s_status[idx].state = WOL_VERIFY_PENDING;
+        s_status[idx].started_at_ms = now_ms();
+        s_status[idx].finished_at_ms = 0;
         xSemaphoreGive(s_status_mutex);
     }
-
-    xTaskCreate(wol_verify_task, "wol_verify", 4096, NULL, 4, NULL);
+    xTaskCreate(wol_verify_task, "wol_verify", 4096, (void *)(intptr_t)idx, 4, NULL);
 }
 
-static esp_err_t wol_get_handler(httpd_req_t *req)
+// ============================================================================
+// Handlers HTTP
+// ============================================================================
+
+static const char INDEX_HTML[] =
+"<!DOCTYPE html>\n"
+"<html lang=\"pt-br\">\n"
+"<head>\n"
+"<meta charset=\"UTF-8\">\n"
+"<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n"
+"<title>Wake on LAN</title>\n"
+"<style>\n"
+"body{background:#111;color:#eee;font-family:sans-serif;max-width:480px;margin:40px auto;padding:0 16px}\n"
+"h1{font-size:20px}\n"
+".card{background:#1c1c1c;border-radius:8px;padding:16px;margin-bottom:12px}\n"
+".name{font-size:16px;font-weight:bold;margin-bottom:8px}\n"
+"button{background:#2d7dd2;color:#fff;border:none;padding:10px 16px;border-radius:6px;font-size:14px;cursor:pointer}\n"
+"button:disabled{background:#444;cursor:default}\n"
+".status{margin-top:8px;font-size:13px;color:#aaa}\n"
+".status.success{color:#4caf50}\n"
+".status.timeout{color:#e05252}\n"
+".status.pending{color:#e0b052}\n"
+"</style>\n"
+"</head>\n"
+"<body>\n"
+"<h1>Wake on LAN</h1>\n"
+"<div id=\"list\">Carregando...</div>\n"
+"<script>\n"
+"const list = document.getElementById(\"list\");\n"
+"async function loadTargets() {\n"
+"  const res = await fetch(\"/api/targets\");\n"
+"  const targets = await res.json();\n"
+"  list.innerHTML = \"\";\n"
+"  targets.forEach(function(t) {\n"
+"    const card = document.createElement(\"div\");\n"
+"    card.className = \"card\";\n"
+"    const nameDiv = document.createElement(\"div\");\n"
+"    nameDiv.className = \"name\";\n"
+"    nameDiv.textContent = t.name;\n"
+"    const btn = document.createElement(\"button\");\n"
+"    btn.textContent = \"Acordar\";\n"
+"    const statusDiv = document.createElement(\"div\");\n"
+"    statusDiv.className = \"status\";\n"
+"    btn.addEventListener(\"click\", function() { wake(t.name, btn, statusDiv); });\n"
+"    card.appendChild(nameDiv);\n"
+"    card.appendChild(btn);\n"
+"    card.appendChild(statusDiv);\n"
+"    list.appendChild(card);\n"
+"  });\n"
+"}\n"
+"async function wake(name, btn, statusDiv) {\n"
+"  btn.disabled = true;\n"
+"  statusDiv.className = \"status pending\";\n"
+"  statusDiv.textContent = \"Enviando pacote...\";\n"
+"  const res = await fetch(\"/api/wol?target=\" + encodeURIComponent(name));\n"
+"  const data = await res.json();\n"
+"  if (data.verifying) {\n"
+"    poll(name, btn, statusDiv);\n"
+"  } else {\n"
+"    statusDiv.className = \"status\";\n"
+"    statusDiv.textContent = \"Pacote enviado\";\n"
+"    btn.disabled = false;\n"
+"  }\n"
+"}\n"
+"async function poll(name, btn, statusDiv) {\n"
+"  const res = await fetch(\"/api/status?target=\" + encodeURIComponent(name));\n"
+"  const data = await res.json();\n"
+"  if (data.state === \"pending\") {\n"
+"    statusDiv.className = \"status pending\";\n"
+"    statusDiv.textContent = \"Aguardando (\" + Math.round(data.elapsed_ms/1000) + \"s)...\";\n"
+"    setTimeout(function() { poll(name, btn, statusDiv); }, 3000);\n"
+"  } else if (data.state === \"success\") {\n"
+"    statusDiv.className = \"status success\";\n"
+"    statusDiv.textContent = \"Ligou! (\" + Math.round(data.elapsed_ms/1000) + \"s)\";\n"
+"    btn.disabled = false;\n"
+"  } else if (data.state === \"timeout\") {\n"
+"    statusDiv.className = \"status timeout\";\n"
+"    statusDiv.textContent = \"Nao respondeu a tempo\";\n"
+"    btn.disabled = false;\n"
+"  } else {\n"
+"    btn.disabled = false;\n"
+"  }\n"
+"}\n"
+"loadTargets();\n"
+"</script>\n"
+"</body>\n"
+"</html>\n";
+
+static esp_err_t index_handler(httpd_req_t *req)
+{
+    httpd_resp_set_type(req, "text/html");
+    httpd_resp_sendstr(req, INDEX_HTML);
+    return ESP_OK;
+}
+
+static esp_err_t api_targets_handler(httpd_req_t *req)
+{
+    char buf[128 * WOL_TARGET_COUNT + 16];
+    size_t off = 0;
+    off += snprintf(buf + off, sizeof(buf) - off, "[");
+    for (size_t i = 0; i < WOL_TARGET_COUNT; i++) {
+        off += snprintf(buf + off, sizeof(buf) - off,
+                         "%s{\"name\":\"%s\"}", i > 0 ? "," : "", WOL_TARGETS[i].name);
+    }
+    off += snprintf(buf + off, sizeof(buf) - off, "]");
+
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_sendstr(req, buf);
+    return ESP_OK;
+}
+
+static esp_err_t api_wol_handler(httpd_req_t *req)
 {
     char query[128] = {0};
-    char mac_str[32] = {0};
-    char ip_str[32] = {0};
-    char port_str[8] = {0};
+    char target_name[48] = {0};
     char token_str[64] = {0};
 
     if (httpd_req_get_url_query_len(req) > 0 &&
         httpd_req_get_url_query_str(req, query, sizeof(query)) == ESP_OK) {
-        httpd_query_key_value(query, "mac", mac_str, sizeof(mac_str));
-        httpd_query_key_value(query, "ip", ip_str, sizeof(ip_str));
-        httpd_query_key_value(query, "port", port_str, sizeof(port_str));
+        httpd_query_key_value(query, "target", target_name, sizeof(target_name));
         httpd_query_key_value(query, "token", token_str, sizeof(token_str));
     }
 
     if (strlen(WOL_SHARED_TOKEN) > 0 && strcmp(token_str, WOL_SHARED_TOKEN) != 0) {
         httpd_resp_set_status(req, "403 Forbidden");
-        httpd_resp_sendstr(req, "Token invalido ou ausente\n");
+        httpd_resp_sendstr(req, "{\"error\":\"token invalido\"}\n");
         return ESP_OK;
     }
 
-    if (strlen(mac_str) == 0) {
-        strncpy(mac_str, WOL_DEFAULT_MAC, sizeof(mac_str) - 1);
+    int idx = find_target(target_name);
+    if (idx < 0) {
+        httpd_resp_set_status(req, "404 Not Found");
+        httpd_resp_sendstr(req, "{\"error\":\"target desconhecido\"}\n");
+        return ESP_OK;
     }
-    if (strlen(ip_str) == 0) {
-        strncpy(ip_str, WOL_DEFAULT_IP, sizeof(ip_str) - 1);
-    }
-    uint16_t port = strlen(port_str) > 0 ? (uint16_t)atoi(port_str) : WOL_DEFAULT_PORT;
 
     uint8_t mac[6];
-    if (!parse_mac(mac_str, mac)) {
-        httpd_resp_set_status(req, "400 Bad Request");
-        httpd_resp_sendstr(req, "MAC invalido. Use ?mac=AA:BB:CC:DD:EE:FF\n");
+    if (!parse_mac(WOL_TARGETS[idx].mac, mac)) {
+        httpd_resp_set_status(req, "500 Internal Server Error");
+        httpd_resp_sendstr(req, "{\"error\":\"MAC invalido na configuracao\"}\n");
         return ESP_OK;
     }
 
     if (send_magic_packet(mac) != ESP_OK) {
         httpd_resp_set_status(req, "500 Internal Server Error");
-        httpd_resp_sendstr(req, "Falha ao enviar pacote magico\n");
+        httpd_resp_sendstr(req, "{\"error\":\"falha ao enviar pacote\"}\n");
         return ESP_OK;
     }
 
-    if (strlen(ip_str) > 0) {
-        start_verification(ip_str, port);
-        char resp[160];
-        snprintf(resp, sizeof(resp),
-                 "Pacote magico enviado. Verificando %s:%u em background "
-                 "(consulte /wol/status)\n", ip_str, port);
-        httpd_resp_sendstr(req, resp);
-    } else {
-        httpd_resp_sendstr(req, "Pacote magico enviado (sem verificacao, IP nao informado)\n");
+    bool has_ip = strlen(WOL_TARGETS[idx].ip) > 0;
+    if (has_ip) {
+        start_verification(idx);
     }
 
+    httpd_resp_set_type(req, "application/json");
+    char resp[64];
+    snprintf(resp, sizeof(resp), "{\"ok\":true,\"verifying\":%s}\n", has_ip ? "true" : "false");
+    httpd_resp_sendstr(req, resp);
     return ESP_OK;
 }
 
-static esp_err_t wol_status_handler(httpd_req_t *req)
+static esp_err_t api_status_handler(httpd_req_t *req)
 {
-    char resp[256];
-    wol_status_t snapshot;
+    char query[96] = {0};
+    char target_name[48] = {0};
 
-    if (xSemaphoreTake(s_status_mutex, portMAX_DELAY) == pdTRUE) {
-        snapshot = s_status;
-        xSemaphoreGive(s_status_mutex);
-    } else {
-        httpd_resp_sendstr(req, "erro interno\n");
+    if (httpd_req_get_url_query_len(req) > 0 &&
+        httpd_req_get_url_query_str(req, query, sizeof(query)) == ESP_OK) {
+        httpd_query_key_value(query, "target", target_name, sizeof(target_name));
+    }
+
+    int idx = find_target(target_name);
+    if (idx < 0) {
+        httpd_resp_set_status(req, "404 Not Found");
+        httpd_resp_sendstr(req, "{\"error\":\"target desconhecido\"}\n");
         return ESP_OK;
+    }
+
+    wol_status_t snapshot;
+    if (xSemaphoreTake(s_status_mutex, portMAX_DELAY) == pdTRUE) {
+        snapshot = s_status[idx];
+        xSemaphoreGive(s_status_mutex);
     }
 
     const char *state_str;
@@ -279,17 +379,15 @@ static esp_err_t wol_status_handler(httpd_req_t *req)
         default: state_str = "none"; break;
     }
 
+    char resp[128];
     if (snapshot.state == WOL_VERIFY_NONE) {
         snprintf(resp, sizeof(resp), "{\"state\":\"none\"}\n");
     } else {
         uint32_t elapsed_ms = (snapshot.finished_at_ms > 0
                                 ? snapshot.finished_at_ms
                                 : now_ms()) - snapshot.started_at_ms;
-        snprintf(resp, sizeof(resp),
-                 "{\"state\":\"%s\",\"target_ip\":\"%s\",\"target_port\":%u,"
-                 "\"elapsed_ms\":%lu}\n",
-                 state_str, snapshot.target_ip, snapshot.target_port,
-                 (unsigned long)elapsed_ms);
+        snprintf(resp, sizeof(resp), "{\"state\":\"%s\",\"elapsed_ms\":%lu}\n",
+                 state_str, (unsigned long)elapsed_ms);
     }
 
     httpd_resp_set_type(req, "application/json");
@@ -297,17 +395,10 @@ static esp_err_t wol_status_handler(httpd_req_t *req)
     return ESP_OK;
 }
 
-static const httpd_uri_t wol_uri = {
-    .uri = "/wol",
-    .method = HTTP_GET,
-    .handler = wol_get_handler,
-};
-
-static const httpd_uri_t wol_status_uri = {
-    .uri = "/wol/status",
-    .method = HTTP_GET,
-    .handler = wol_status_handler,
-};
+static const httpd_uri_t uri_index        = { .uri = "/",             .method = HTTP_GET, .handler = index_handler };
+static const httpd_uri_t uri_api_targets  = { .uri = "/api/targets",  .method = HTTP_GET, .handler = api_targets_handler };
+static const httpd_uri_t uri_api_wol      = { .uri = "/api/wol",      .method = HTTP_GET, .handler = api_wol_handler };
+static const httpd_uri_t uri_api_status   = { .uri = "/api/status",   .method = HTTP_GET, .handler = api_status_handler };
 
 esp_err_t wol_http_server_start(void)
 {
@@ -316,6 +407,7 @@ esp_err_t wol_http_server_start(void)
         ESP_LOGE(TAG, "Falha ao criar mutex de status");
         return ESP_ERR_NO_MEM;
     }
+    memset(s_status, 0, sizeof(s_status));
 
     httpd_handle_t server = NULL;
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
@@ -328,8 +420,12 @@ esp_err_t wol_http_server_start(void)
         return ret;
     }
 
-    httpd_register_uri_handler(server, &wol_uri);
-    httpd_register_uri_handler(server, &wol_status_uri);
-    ESP_LOGI(TAG, "Servidor WoL iniciado na porta %d (/wol, /wol/status)", config.server_port);
+    httpd_register_uri_handler(server, &uri_index);
+    httpd_register_uri_handler(server, &uri_api_targets);
+    httpd_register_uri_handler(server, &uri_api_wol);
+    httpd_register_uri_handler(server, &uri_api_status);
+
+    ESP_LOGI(TAG, "Servidor WoL iniciado na porta %d (%d PCs configurados)",
+             config.server_port, (int)WOL_TARGET_COUNT);
     return ESP_OK;
 }
