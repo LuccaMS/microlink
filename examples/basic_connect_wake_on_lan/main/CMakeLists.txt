@@ -1,5 +1,5 @@
 idf_component_register(
-    SRCS "main.c" "wol.c"
+    SRCS "main.c" "wol.c" "conn_watchdog.c"
     INCLUDE_DIRS "."
     REQUIRES microlink nvs_flash esp_wifi esp_netif esp_event esp_http_server
 )

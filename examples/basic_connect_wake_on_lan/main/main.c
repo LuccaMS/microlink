@@ -24,6 +24,9 @@
 #include "esp_netif.h"
 
 #include "wol.h"
+#include "conn_watchdog.h"
+
+#include "esp_task_wdt.h"
 
 #include "microlink.h"
 #include "microlink_internal.h"  /* For task handle access (diagnostic) */
@@ -216,6 +219,16 @@ static void wifi_init(void) {
  * ========================================================================== */
 
 void app_main(void) {
+    /* Task Watchdog Timer: reinicia o ESP se esta task travar */
+    esp_task_wdt_config_t twdt_config = {
+        .timeout_ms = 30000,
+        .idle_core_mask = 0,
+        .trigger_panic = true,
+    };
+    esp_task_wdt_reconfigure(&twdt_config);
+    esp_task_wdt_add(NULL);
+    // <-- fim do bloco novo
+
     /* Initialize NVS (required for WiFi + MicroLink key storage) */
     esp_err_t ret = nvs_flash_init();
     if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
@@ -293,6 +306,8 @@ void app_main(void) {
         vTaskDelay(pdMS_TO_TICKS(500));
     }
 
+    conn_watchdog_start(ml, 5 * 60 * 1000);
+
     /* Create UDP socket on port 9000 */
     udp_sock = microlink_udp_create(ml, MSG_PORT);
     if (!udp_sock) {
@@ -322,7 +337,9 @@ void app_main(void) {
     uint64_t last_status_ms = 0;
 
     while (1) {
-        vTaskDelay(pdMS_TO_TICKS(1000));
+        vTaskDelay(pdMS_TO_TICKS(1000));    
+
+        esp_task_wdt_reset();   // <-- adicionar logo após o vTaskDelay
 
         uint64_t now = (uint64_t)(xTaskGetTickCount() * portTICK_PERIOD_MS);
 
