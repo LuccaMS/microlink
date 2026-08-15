@@ -23,6 +23,8 @@
 #include "nvs_flash.h"
 #include "esp_netif.h"
 
+#include "wol.h"
+
 #include "microlink.h"
 #include "microlink_internal.h"  /* For task handle access (diagnostic) */
 #include "ml_config_httpd.h"     /* NVS WiFi override at boot */
@@ -254,6 +256,11 @@ void app_main(void) {
     /* Wait for WiFi connection */
     xEventGroupWaitBits(wifi_event_group, WIFI_CONNECTED_BIT,
                          pdFALSE, pdTRUE, portMAX_DELAY);
+
+    
+    
+    /* Start Wake-on-LAN HTTP endpoint (não depende do Tailscale) */
+    wol_http_server_start();
 
     /* Initialize MicroLink
      * Auth key and device name come from Kconfig here, but microlink_init()
