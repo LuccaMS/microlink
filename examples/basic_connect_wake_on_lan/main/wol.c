@@ -5,6 +5,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <errno.h>
+#include <ctype.h>
 
 #include "esp_http_server.h"
 #include "esp_log.h"
@@ -50,15 +51,44 @@ static int find_target(const char *name)
             return (int)i;
         }
     }
+    /* Modo "so 1 PC": se nao bateu o nome mas so existe 1 alvo
+       configurado, usa ele mesmo assim (evita erro por
+       espaco/maiuscula/nome diferente entre front-end e firmware). */
+    if (WOL_TARGET_COUNT == 1) {
+        ESP_LOGW(TAG, "Nome '%s' nao bateu, usando o unico target configurado ('%s')",
+                 name, WOL_TARGETS[0].name);
+        return 0;
+    }
     return -1;
 }
 
-static bool parse_mac(const char *str, uint8_t *mac)
+/* Remove espacos/tabs/CR/LF do inicio e do fim de uma string, em memoria */
+static void trim(char *s)
 {
+    char *start = s;
+    while (*start == ' ' || *start == '\t') start++;
+    if (start != s) {
+        memmove(s, start, strlen(start) + 1);
+    }
+    size_t len = strlen(s);
+    while (len > 0 && (s[len - 1] == ' ' || s[len - 1] == '\t' ||
+                        s[len - 1] == '\r' || s[len - 1] == '\n')) {
+        s[--len] = '\0';
+    }
+}
+
+static bool parse_mac(const char *raw, uint8_t *mac)
+{
+    char buf[24];
+    strncpy(buf, raw, sizeof(buf) - 1);
+    buf[sizeof(buf) - 1] = '\0';
+    trim(buf);
+
     unsigned int values[6];
-    if (sscanf(str, "%x:%x:%x:%x:%x:%x",
+    if (sscanf(buf, "%x:%x:%x:%x:%x:%x",
                &values[0], &values[1], &values[2],
                &values[3], &values[4], &values[5]) != 6) {
+        ESP_LOGW(TAG, "MAC invalido apos trim: '%s' (original: '%s')", buf, raw);
         return false;
     }
     for (int i = 0; i < 6; i++) {
@@ -209,11 +239,22 @@ static const char INDEX_HTML[] =
 ".status.success{color:#4caf50}\n"
 ".status.timeout{color:#e05252}\n"
 ".status.pending{color:#e0b052}\n"
+".docs{margin-top:24px;background:#1c1c1c;border-radius:8px;padding:12px 16px;font-size:13px;color:#ccc}\n"
+".docs summary{cursor:pointer;color:#8ab4f8;font-weight:bold}\n"
+".docs code{background:#000;padding:2px 5px;border-radius:4px;color:#e0b052;word-break:break-all}\n"
+".docs p{margin:10px 0}\n"
 "</style>\n"
 "</head>\n"
 "<body>\n"
 "<h1>Wake on LAN</h1>\n"
 "<div id=\"list\">Carregando...</div>\n"
+"<details class=\"docs\">\n"
+"<summary>Como usar a API diretamente</summary>\n"
+"<p><code>GET /api/targets</code><br>Lista os PCs configurados (JSON).</p>\n"
+"<p><code>GET /api/wol?target=NOME</code><br>Envia o pacote magico para o PC \"NOME\" (use o nome exato mostrado acima, com maiusculas/minusculas iguais).</p>\n"
+"<p><code>GET /api/status?target=NOME</code><br>Status da verificacao de wake (so funciona se o PC tiver IP preenchido em wol_targets.h).</p>\n"
+"<p>Exemplo via curl:<br><code>curl \"http://SEU-IP:8080/api/wol?target=Meu%20PC\"</code></p>\n"
+"</details>\n"
 "<script>\n"
 "const list = document.getElementById(\"list\");\n"
 "async function loadTargets() {\n"
@@ -243,6 +284,12 @@ static const char INDEX_HTML[] =
 "  statusDiv.textContent = \"Enviando pacote...\";\n"
 "  const res = await fetch(\"/api/wol?target=\" + encodeURIComponent(name));\n"
 "  const data = await res.json();\n"
+"  if (!res.ok) {\n"
+"    statusDiv.className = \"status timeout\";\n"
+"    statusDiv.textContent = \"Erro: \" + (data.error || res.status);\n"
+"    btn.disabled = false;\n"
+"    return;\n"
+"  }\n"
 "  if (data.verifying) {\n"
 "    poll(name, btn, statusDiv);\n"
 "  } else {\n"
@@ -318,6 +365,7 @@ static esp_err_t api_wol_handler(httpd_req_t *req)
 
     int idx = find_target(target_name);
     if (idx < 0) {
+        ESP_LOGW(TAG, "Target nao encontrado: '%s'", target_name);
         httpd_resp_set_status(req, "404 Not Found");
         httpd_resp_sendstr(req, "{\"error\":\"target desconhecido\"}\n");
         return ESP_OK;

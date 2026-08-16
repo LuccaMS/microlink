@@ -13,7 +13,7 @@ typedef struct {
 } wol_target_t;
 
 static const wol_target_t WOL_TARGETS[] = {
-    { "Meu PC", "9C:6B:00:A3:D3:A3", "", 0 },
+    {"Meu PC", "9C:6B:00:A3:D3:A3", "", 0},
 };
 
 #define WOL_TARGET_COUNT (sizeof(WOL_TARGETS) / sizeof(WOL_TARGETS[0]))
